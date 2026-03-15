@@ -1618,6 +1618,7 @@ char *host_from_dns(struct in_addr addr);
 
 /* lease.c */
 #ifdef HAVE_DHCP
+struct dhcp_lease *lease_get_all(void);
 void lease_update_file(time_t now);
 void lease_update_dns(int force);
 void lease_init(time_t now);

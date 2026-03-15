@@ -163,6 +163,11 @@ static int read_leases(time_t now, FILE *leasestream)
     return (items == 0 || items == EOF);
 }
 
+struct dhcp_lease *lease_get_all(void)
+{
+  return leases;
+}
+
 void lease_init(time_t now)
 {
   FILE *leasestream;

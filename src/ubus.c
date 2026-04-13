@@ -258,7 +258,9 @@ static int ubus_handle_add_lease(struct ubus_context *ctx, struct ubus_object *o
   union all_addr addr;
   unsigned char hwaddr_bin[DHCP_CHADDR_MAX];
   unsigned char clid_bin[256];
+  char hwaddr_str[DHCP_CHADDR_MAX * 3 + 1];
   int hw_len, hw_type, clid_len = 0;
+  int i;
   time_t now = dnsmasq_time();
   uint32_t expires;
   uint32_t ia_id = 0;
@@ -290,6 +292,42 @@ static int ubus_handle_add_lease(struct ubus_context *ctx, struct ubus_object *o
   if (tb[ADD_LEASE_IS_TEMPORARY])
     is_temporary = blobmsg_get_bool(tb[ADD_LEASE_IS_TEMPORARY]);
 
+  if (expires == 0)
+    {
+      my_syslog(LOG_ERR, _("UBus add_lease: expires must be non-zero"));
+      return UBUS_STATUS_INVALID_ARGUMENT;
+    }
+
+  hw_len = parse_hex((char*)hwaddr, hwaddr_bin, DHCP_CHADDR_MAX, NULL, &hw_type);
+  if (hw_len <= 0)
+    {
+      my_syslog(LOG_ERR, _("UBus add_lease: invalid MAC address '%s'"), hwaddr);
+      return UBUS_STATUS_INVALID_ARGUMENT;
+    }
+
+  if (hw_type == 0)
+    hw_type = ARPHRD_ETHER;
+
+  if (client_id && *client_id)
+    {
+      clid_len = parse_hex((char*)client_id, clid_bin, sizeof(clid_bin), NULL, NULL);
+      if (clid_len < 0)
+	{
+	  my_syslog(LOG_WARNING, _("UBus add_lease: invalid client_id '%s', ignoring"), client_id);
+	  clid_len = 0;
+	}
+    }
+
+  if (hostname && *hostname && !legal_hostname((char *)hostname))
+    {
+      my_syslog(LOG_ERR, _("UBus add_lease: invalid hostname '%s'"), hostname);
+      return UBUS_STATUS_INVALID_ARGUMENT;
+    }
+
+  for (i = 0; i < hw_len; i++)
+    sprintf(hwaddr_str + i * 3, "%02x:", hwaddr_bin[i]);
+  hwaddr_str[hw_len * 3 - 1] = '\0';
+
   if (inet_pton(AF_INET, ipaddr, &addr.addr4))
     {
       if (!daemon->dhcp)
@@ -316,11 +354,21 @@ static int ubus_handle_add_lease(struct ubus_context *ctx, struct ubus_object *o
 	  return UBUS_STATUS_INVALID_ARGUMENT;
 	}
 
-      if (!(lease = lease6_find_by_addr(&addr.addr6, 128, 0)))
-	lease = lease6_allocate(&addr.addr6, is_temporary ? LEASE_TA : LEASE_NA);
-
-      if (lease)
-	lease_set_iaid(lease, ia_id);
+      if ((lease = lease6_find_by_addr(&addr.addr6, 128, 0)))
+	{
+	  if (lease->iaid != ia_id)
+	    {
+	      my_syslog(LOG_ERR, _("UBus add_lease: iaid %u does not match existing lease for %s"),
+			ia_id, ipaddr);
+	      return UBUS_STATUS_INVALID_ARGUMENT;
+	    }
+	}
+      else
+	{
+	  lease = lease6_allocate(&addr.addr6, is_temporary ? LEASE_TA : LEASE_NA);
+	  if (lease)
+	    lease_set_iaid(lease, ia_id);
+	}
     }
 #endif
   else
@@ -335,26 +383,6 @@ static int ubus_handle_add_lease(struct ubus_context *ctx, struct ubus_object *o
       return UBUS_STATUS_UNKNOWN_ERROR;
     }
 
-  hw_len = parse_hex((char*)hwaddr, hwaddr_bin, DHCP_CHADDR_MAX, NULL, &hw_type);
-  if (hw_len < 0)
-    {
-      my_syslog(LOG_ERR, _("UBus add_lease: invalid MAC address '%s'"), hwaddr);
-      return UBUS_STATUS_INVALID_ARGUMENT;
-    }
-
-  if (hw_type == 0 && hw_len != 0)
-    hw_type = ARPHRD_ETHER;
-
-  if (client_id && *client_id)
-    {
-      clid_len = parse_hex((char*)client_id, clid_bin, sizeof(clid_bin), NULL, NULL);
-      if (clid_len < 0)
-	{
-	  my_syslog(LOG_WARNING, _("UBus add_lease: invalid client_id '%s', ignoring"), client_id);
-	  clid_len = 0;
-	}
-    }
-
   lease_set_hwaddr(lease, hwaddr_bin, clid_len > 0 ? clid_bin : NULL,
 		   hw_len, hw_type, clid_len, now, 0);
 
@@ -363,12 +391,6 @@ static int ubus_handle_add_lease(struct ubus_context *ctx, struct ubus_object *o
 
   if (hostname && *hostname)
     {
-      if (!legal_hostname((char *)hostname))
-	{
-	  my_syslog(LOG_ERR, _("UBus add_lease: invalid hostname '%s'"), hostname);
-	  return UBUS_STATUS_INVALID_ARGUMENT;
-	}
-
 #ifdef HAVE_DHCP6
       if (lease->flags & (LEASE_TA | LEASE_NA))
 	lease_set_hostname(lease, hostname, 0, get_domain6(&lease->addr6), NULL);
@@ -386,7 +408,7 @@ static int ubus_handle_add_lease(struct ubus_context *ctx, struct ubus_object *o
   lease->flags &= ~(LEASE_NEW | LEASE_CHANGED | LEASE_AUX_CHANGED | LEASE_EXP_CHANGED);
 
   my_syslog(LOG_INFO, _("UBus add_lease: added %s %s %s"),
-	    ipaddr, hwaddr, hostname ? hostname : "");
+	    ipaddr, hwaddr_str, hostname ? hostname : "");
 
   return UBUS_STATUS_OK;
 }
@@ -442,8 +464,9 @@ static int ubus_handle_get_leases(struct ubus_context *ctx, struct ubus_object *
   struct dhcp_lease *lease;
   void *array, *table;
   char addr_str[INET6_ADDRSTRLEN];
-  char hwaddr_str[DHCP_CHADDR_MAX * 3];
-  int i;
+  char hwaddr_str[DHCP_CHADDR_MAX * 3 + 1];
+  char clid_str[256 * 3 + 1];
+  int i, n;
   time_t now = dnsmasq_time();
 
   (void)obj;
@@ -476,7 +499,7 @@ static int ubus_handle_get_leases(struct ubus_context *ctx, struct ubus_object *
 	{
 	  for (i = 0; i < lease->hwaddr_len && i < DHCP_CHADDR_MAX; i++)
 	    sprintf(hwaddr_str + i * 3, "%02x:", lease->hwaddr[i]);
-	  hwaddr_str[lease->hwaddr_len * 3 - 1] = '\0';
+	  hwaddr_str[i * 3 - 1] = '\0';
 	  CHECK(blobmsg_add_string(&b, "mac", hwaddr_str));
 	}
 
@@ -496,11 +519,12 @@ static int ubus_handle_get_leases(struct ubus_context *ctx, struct ubus_object *
 
       if (lease->clid && lease->clid_len > 0)
 	{
-	  /* 255 * 3 = 765 < MAXDNAME */
-	  char *clid_str = daemon->namebuff;
-	  for (i = 0; i < lease->clid_len && i < 255; i++)
+	  n = lease->clid_len;
+	  if (n > (int)(sizeof(clid_str) - 1) / 3)
+	    n = (int)(sizeof(clid_str) - 1) / 3;
+	  for (i = 0; i < n; i++)
 	    sprintf(clid_str + i * 3, "%02x:", lease->clid[i]);
-	  clid_str[lease->clid_len * 3 - 1] = '\0';
+	  clid_str[n * 3 - 1] = '\0';
 	  CHECK(blobmsg_add_string(&b, "client_id", clid_str));
 	}
 
